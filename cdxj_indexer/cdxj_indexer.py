@@ -4,9 +4,11 @@ from warcio.indexer import Indexer
 from warcio.timeutils import iso_date_to_timestamp
 from warcio.warcwriter import BufferWARCWriter
 from warcio.archiveiterator import ArchiveIterator
+import warcio.recordloader
 
 from argparse import ArgumentParser, RawTextHelpFormatter
-from cdxj_indexer.postquery import append_post_query
+from postquery import append_post_query
+import custom_index
 
 from io import BytesIO
 from copy import copy
@@ -155,7 +157,7 @@ class CDXJIndexer(Indexer):
             value = value.split(':')[-1]
         return value
 
-    def _write_line(self, out, index, record, filename):
+    def _write_line(self, out, index, record, filename): # Possibility 1: add custom staff here through the record, raw stream
         url = index.get('url')
         if not url:
             url = record.rec_headers.get('WARC-Target-URI')
@@ -251,7 +253,7 @@ class CDXLegacyIndexer(CDXJIndexer):
         index['timestamp'] = ts
 
         line = ' '.join(index.get(field, '-') for field in self.CDX_FIELDS)
-        out.write(line + '\n')
+        #out.write(line + '\n')
 
     def _write_header(self, out, filename):
         out.write(self.CDX_HEADER + '\n')
@@ -263,6 +265,71 @@ class CDX11Indexer(CDXLegacyIndexer):
 
     CDX_FIELDS = ['urlkey', 'timestamp', 'url', 'mime', 'status', 'digest',
                   'redirect', 'meta', 'length', 'offset', 'filename']
+
+# ============================================================================
+# TODO a new indexer class for customization
+class CDX_EX_Indexer(CDXLegacyIndexer):
+    CDX_HEADER = ' CDX N b a m s k r M S V g J'
+
+    CDX_FIELDS = ['urlkey', 'timestamp', 'url', 'mime', 'status', 'digest',
+                  'redirect', 'meta', 'length', 'offset', 'filename','javascript']
+    current_raw_body = ''
+
+
+    def process_one(self, input_, output, filename):
+        self.curr_filename = self.force_filename or os.path.basename(filename)
+
+        it = self._create_record_iter(input_)
+
+        self._write_header(output, filename)
+
+        if self.collect_records:
+            wrap_it = self.req_resolving_iter(it)
+        else:
+            wrap_it = it
+
+        for record in wrap_it:
+            if not self.write_records or record.rec_type in self.write_records:
+                # Save raw_body content to a tmp variable
+                if record.rec_type == 'response':
+                    self.current_raw_body = record.raw_stream.read()
+                else:
+                    # reset raw_body
+                    self.current_raw_body = ''
+
+                self.process_index_entry(it, record, filename, output) #TODO: find out why raw_content get lost after this point
+
+
+
+    def _do_write(self, urlkey, ts, index, out):
+        index['urlkey'] = urlkey
+        index['timestamp'] = ts
+
+        line = ' '.join(index.get(field, '-') for field in self.CDX_FIELDS)
+        out.write(line + '\n')
+
+    # overwrite write line function for customization
+    def _write_line(self, out, index, record, filename):
+        url = index.get('url')
+        if not url:
+            url = record.rec_headers.get('WARC-Target-URI')
+
+        dt = record.rec_headers.get('WARC-Date')
+
+        ts = iso_date_to_timestamp(dt)
+
+        # # TODO do my own index search here
+        if self.current_raw_body != '':
+            index['javascript'] = custom_index.javascript_index(self.current_raw_body)
+
+        if hasattr(record, 'urlkey'):
+            urlkey = record.urlkey
+        else:
+            urlkey = self.get_url_key(url)
+
+        self._do_write(urlkey, ts, index, out)
+
+
 
 
 # ============================================================================
@@ -288,6 +355,9 @@ def main(args=None):
     group.add_argument('-11', '--cdx11',
                         action='store_true')
 
+    group.add_argument('-ex', '--cdxEX',
+                       action='store_true')
+
     group.add_argument('-f', '--fields')
     group.add_argument('-rf', '--replace-fields')
 
@@ -307,14 +377,23 @@ def write_cdx_index(output, inputs, opt):
         cls = CDX11Indexer
     elif opt.get('cdx09'):
         cls = CDX09Indexer
+    elif opt.get('cdxEX'):
+        cls = CDX_EX_Indexer
     else:
         cls = CDXJIndexer
 
     if isinstance(inputs, str) or hasattr(inputs, 'read'):
         inputs = [inputs]
 
+    start_time = time.time()
+    # main process
     indexer = cls(output, inputs, opt)
     indexer.process_all()
+
+    end_time = time.time()
+    duration = start_time - end_time
+    print("Duration", duration)
+
 
 
 # ============================================================================
